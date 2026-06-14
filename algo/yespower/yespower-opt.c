@@ -83,6 +83,18 @@
 #undef PREFETCH
 #endif
 
+/* Prefetch S-box entries 2 PWXFORM iterations ahead to hide scratchpad latency.
+ * PWXFORM_SIMD reads S0+lo and S1+hi pseudo-randomly; without prefetch these
+ * are guaranteed L3/DRAM misses for large N on EPYC / any NUMA system.
+ * The stride of 2*16=32 bytes matches one PWXsimple*8 unit. */
+#ifdef __SSE__
+#define PWXFORM_PREFETCH(S0_, S1_, lo_, hi_) \
+   __builtin_prefetch((const char *)(S0_) + (lo_) + 64, 0, 1); \
+   __builtin_prefetch((const char *)(S1_) + (hi_) + 64, 0, 1);
+#else
+#define PWXFORM_PREFETCH(S0_, S1_, lo_, hi_) /* nothing */
+#endif
+
 typedef union
 {
 	uint32_t d[16];
@@ -516,8 +528,8 @@ static inline void salsa20_simd_unshuffle(const salsa20_blk_t *Bin,
  * Compute Bout = BlockMix_{salsa20, 1}(Bin).  The input Bin must be 128
  * bytes in length; the output Bout must also be the same size.
  */
-static inline void blockmix_salsa( const salsa20_blk_t *restrict Bin,
-                                   salsa20_blk_t *restrict Bout )
+static inline void __attribute__((hot)) blockmix_salsa(
+   const salsa20_blk_t *restrict Bin, salsa20_blk_t *restrict Bout )
 {
    salsa20_blk_t X;
 
@@ -526,8 +538,9 @@ static inline void blockmix_salsa( const salsa20_blk_t *restrict Bin,
 	SALSA20_XOR_MEM(Bin[1], Bout[1]);
 }
 
-static inline uint32_t blockmix_salsa_xor( const salsa20_blk_t *restrict Bin1,
-           const salsa20_blk_t *restrict Bin2, salsa20_blk_t *restrict Bout )
+static inline uint32_t __attribute__((hot)) blockmix_salsa_xor(
+   const salsa20_blk_t *restrict Bin1,
+   const salsa20_blk_t *restrict Bin2, salsa20_blk_t *restrict Bout )
 {
    salsa20_blk_t X;
 
@@ -574,17 +587,16 @@ typedef struct {
 
 #define DECL_SMASK2REG uint64_t Smask2reg = Smask2;
 
-/*
-#define FORCE_REGALLOC_1 \
-	__asm__("" : "=a" (x), "+d" (Smask2reg), "+S" (S0), "+D" (S1));
-#define FORCE_REGALLOC_2 \
-	__asm__("" : : "c" (lo));
-*/
-
+/* PWXFORM_SIMD: compute one pwxform lane and prefetch the NEXT iteration's
+ * S-box entries to hide the pseudo-random scratchpad latency.
+ * lo/hi are the current iteration's S0/S1 offsets.  The +64 prefetch
+ * distance is one cache line ahead — enough for ~200 cycle DRAM latency
+ * on a typical 3-4 GHz core. */
 #define PWXFORM_SIMD(X) { \
 	uint64_t x; \
 	uint32_t lo = x = EXTRACT64(X) & Smask2reg; \
 	uint32_t hi = x >> 32; \
+   PWXFORM_PREFETCH(S0, S1, lo, hi) \
 	X = v128_mulw32( v128_shuflr32(X), X ); \
 	X = v128_add64( X, *(v128_t *)(S0 + lo) ); \
 	X = v128_xor( X, *(v128_t *)(S1 + hi) ); \
@@ -648,8 +660,9 @@ typedef struct {
  * Compute Bout = BlockMix_pwxform{salsa20, r, S}(Bin).  The input Bin must
  * be 128r bytes in length; the output Bout must also be the same size.
  */
-static void blockmix( const salsa20_blk_t *restrict Bin,
-    salsa20_blk_t *restrict Bout, size_t r, pwxform_ctx_t *restrict ctx )
+static void __attribute__((hot,noinline)) blockmix(
+   const salsa20_blk_t *restrict Bin,
+   salsa20_blk_t *restrict Bout, size_t r, pwxform_ctx_t *restrict ctx )
 {
 	if ( unlikely(!ctx) )
    {
@@ -693,9 +706,10 @@ static void blockmix( const salsa20_blk_t *restrict Bin,
 	SALSA20(Bout[i])
 }
 
-static uint32_t blockmix_xor( const salsa20_blk_t *restrict Bin1,
-           const salsa20_blk_t *restrict Bin2, salsa20_blk_t *restrict Bout,
-           size_t r, pwxform_ctx_t *restrict ctx )
+static uint32_t __attribute__((hot,noinline)) blockmix_xor(
+   const salsa20_blk_t *restrict Bin1,
+   const salsa20_blk_t *restrict Bin2, salsa20_blk_t *restrict Bout,
+   size_t r, pwxform_ctx_t *restrict ctx )
 {
 	if ( unlikely( !ctx ) )
 		return blockmix_salsa_xor( Bin1, Bin2, Bout );
@@ -750,8 +764,9 @@ static uint32_t blockmix_xor( const salsa20_blk_t *restrict Bin1,
 	return INTEGERIFY( X0 );
 }
 
-static uint32_t blockmix_xor_save( salsa20_blk_t *restrict Bin1out,
-        salsa20_blk_t *restrict Bin2,  size_t r, pwxform_ctx_t *restrict ctx )
+static uint32_t __attribute__((hot,noinline)) blockmix_xor_save(
+   salsa20_blk_t *restrict Bin1out,
+   salsa20_blk_t *restrict Bin2, size_t r, pwxform_ctx_t *restrict ctx )
 {
    v128_t X0, X1, X2, X3;
    v128_t Y0, Y1, Y2, Y3;
@@ -829,7 +844,7 @@ static inline uint32_t integerify(const salsa20_blk_t *B, size_t r)
  * The array V must be aligned to a multiple of 64 bytes, and arrays B and XY
  * to a multiple of at least 16 bytes.
  */
-static void smix1(uint8_t *B, size_t r, uint32_t N,
+static void __attribute__((hot)) smix1(uint8_t *B, size_t r, uint32_t N,
     salsa20_blk_t *V, salsa20_blk_t *XY, pwxform_ctx_t *ctx)
 {
 	size_t s = 2 * r;
@@ -906,8 +921,8 @@ static void smix1(uint8_t *B, size_t r, uint32_t N,
  * least 2.  Nloop must be even.  The array V must be aligned to a multiple of
  * 64 bytes, and arrays B and XY to a multiple of at least 16 bytes.
  */
-static void smix2(uint8_t *B, size_t r, uint32_t N, uint32_t Nloop,
-    salsa20_blk_t *V, salsa20_blk_t *XY, pwxform_ctx_t *ctx)
+static void __attribute__((hot)) smix2(uint8_t *B, size_t r, uint32_t N,
+   uint32_t Nloop, salsa20_blk_t *V, salsa20_blk_t *XY, pwxform_ctx_t *ctx)
 {
 	size_t s = 2 * r;
 	salsa20_blk_t *X = XY, *Y = &XY[s];
@@ -965,7 +980,7 @@ static void smix2(uint8_t *B, size_t r, uint32_t N, uint32_t Nloop,
  * to a multiple of at least 16 bytes (aligning them to 64 bytes as well saves
  * cache lines, but it might also result in cache bank conflicts).
  */
-static void smix(uint8_t *B, size_t r, uint32_t N,
+static void __attribute__((hot)) smix(uint8_t *B, size_t r, uint32_t N,
     salsa20_blk_t *V, salsa20_blk_t *XY, pwxform_ctx_t *ctx)
 {
 #if _YESPOWER_OPT_C_PASS_ == 1

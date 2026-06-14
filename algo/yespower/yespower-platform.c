@@ -55,10 +55,16 @@ static void *alloc_region(yespower_region_t *region, size_t size)
 	base = mmap(NULL, new_size, PROT_READ | PROT_WRITE, flags, -1, 0);
 	if (base != MAP_FAILED) {
 		base_size = new_size;
-
 	} else if (flags & MAP_HUGETLB) {
+		/* MAP_HUGETLB failed — fall back to regular pages and advise THP.
+		 * Without MADV_HUGEPAGE the kernel will NOT promote these pages
+		 * to 2MB transparently on most distros (THP default = madvise). */
 		flags &= ~MAP_HUGETLB;
 		base = mmap(NULL, size, PROT_READ | PROT_WRITE, flags, -1, 0);
+#if defined(MADV_HUGEPAGE)
+		if (base != MAP_FAILED)
+			madvise(base, size, MADV_HUGEPAGE);
+#endif
 	}
 
 #else
