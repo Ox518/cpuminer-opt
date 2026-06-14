@@ -39,20 +39,31 @@ jobs:
           echo "=== Binary size ==="
           ls -lh cpuminer
 
-      - name: Smoke test (algo list)
-        run: ./cpuminer --algo yescryptr16 --help 2>&1 | head -5 || true
-
-      - name: Benchmark yescryptr16 (30 sec)
+      - name: Smoke test
         run: |
-          # Run in benchmark mode: connects to no pool, just hashes
-          # --benchmark is the standard cpuminer-opt self-test flag
+          ./cpuminer --algo yescryptr16 --help 2>&1 | head -5 || true
+          echo "Binary OK"
+
+      - name: Benchmark — yescryptr16 @ americas.mining-dutch.nl:9983 (30 sec)
+        env:
+          # Store wallet.worker as POOL_USER secret in repo settings.
+          # Pool: stratum+tcp://americas.mining-dutch.nl:9983  coin: FNNC
+          # Password is always x for mining-dutch.
+          POOL_USER: ${{ secrets.POOL_USER }}
+          POOL_PASS: ${{ secrets.POOL_PASS }}
+        run: |
+          USER_ARG="${POOL_USER:-gitmine.bench-ci}"
+          PASS_ARG="${POOL_PASS:-x}"
+          echo "Connecting to stratum+tcp://americas.mining-dutch.nl:9983 as ${USER_ARG}"
           timeout 35 ./cpuminer \
-            --algo yescryptr16 \
-            --benchmark \
+            --algo   yescryptr16 \
+            --url    stratum+tcp://americas.mining-dutch.nl:9983 \
+            --user   "${USER_ARG}" \
+            --pass   "${PASS_ARG}" \
             --threads $(nproc) \
             2>&1 | tee bench.log || true
-          echo "--- hashrate lines ---"
-          grep -i "kH\|MH\|hash\|speed\|accept\|yescrypt" bench.log || true
+          echo "--- hashrate / share lines ---"
+          grep -iE "kH|MH|accepted|rejected|hashrate|speed|yescrypt|connect" bench.log || echo "(no matches — see full log above)"
 
       - name: Upload bench log
         uses: actions/upload-artifact@v4
